@@ -1,0 +1,416 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: panel-config
+  namespace: default
+data:
+  APP_URL: "https://hostmaster.myvnc.com"
+  APP_ENV: "production"
+  APP_TIMEZONE: "UTC"
+  CACHE_DRIVER: "redis"
+  SESSION_DRIVER: "redis"
+  QUEUE_DRIVER: "redis"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  DB_HOST: "pterodactyl-mysql"
+  DB_PORT: "3306"
+  DB_DATABASE: "pterodactyl"
+  DB_USERNAME: "pterodactyl"
+  MAIL_DRIVER: "smtp"
+  MAIL_HOST: "smtp.example.com"
+  MAIL_PORT: "587"
+  MAIL_ENCRYPTION: "tls"
+  MAIL_FROM: "x"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: panel-secret
+  namespace: default
+type: Opaque
+data:
+  DB_PASSWORD: x
+  MAIL_PASSWORD: x
+  APP_KEY: x
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pterodactyl-panel-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config
+  namespace: metallb-system
+data:
+  config: |
+    address-pools:
+    - name: default
+      protocol: layer2
+      addresses:
+      - 192.168.0.240-192.168.0.250  # Intervalo de IPs que o MetalLB pode alocar para LoadBalancers
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: x
+    privateKeySecretRef:
+      name: letsencrypt-prod-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pterodactyl-panel
+  namespace: default
+  labels:
+    app: pterodactyl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pterodactyl
+  template:
+    metadata:
+      labels:
+        app: pterodactyl
+    spec:
+      initContainers:
+        - name: fix-storage-permissions
+          image: busybox
+          command: ["sh", "-c", "mkdir -p /app/storage/framework/{cache,sessions,views} && chmod -R 777 /app/storage && chown -R 1000:1000 /app/storage"]
+          volumeMounts:
+            - name: panel-data
+              mountPath: /app/storage
+      containers:
+        - name: panel
+          image: ghcr.io/pterodactyl/panel:v1.11.10
+          ports:
+            - containerPort: 80    # Porta HTTP
+            - containerPort: 443   # Porta HTTPS
+          envFrom:
+            - configMapRef:
+                name: panel-config
+            - secretRef:
+                name: panel-secret
+          env:
+            - name: APP_URL
+              value: "https://hostmaster.myvnc.com"
+            - name: SSL_CERTIFICATE
+              value: "/etc/ssl/certs/tls.crt"
+            - name: SSL_CERTIFICATE_KEY
+              value: "/etc/ssl/certs/tls.key"
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "512m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 600
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 600
+            periodSeconds: 10
+#          volumeMounts:
+#            - name: nginx-config
+#              mountPath: /etc/nginx/http.d/panel.conf  # Montando o arquivo no diretório correto
+#              subPath: panel.conf                      # Assegura que o arquivo é montado com o nome correto
+      volumes:
+        - name: panel-data
+          persistentVolumeClaim:
+            claimName: pterodactyl-panel-pvc
+        - name: ssl-certificates
+          secret:
+            secretName: pterodactyl-ssl-certificates
+        - name: nginx-config
+          configMap:
+            name: pterodactyl-nginx-config  # Referência ao ConfigMap criado
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pterodactyl-ssl-certificates
+  namespace: default
+type: Opaque
+data:
+  tls.crt: "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURIekNDQWdlZ0F3SUJBZ0lVVnEwdzR5eEp2ZHd5NGZMMHpQZkswUHpIY0Zvd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0h6RWRNQnNHQTFVRUF3d1VhRzl6ZEcxaGMzUmxjaTV0ZVhadVl5NWpiMjB3SGhjTk1qUXhNakV6TVRnegpOVEkxV2hjTk1qVXhNakV6TVRnek5USTFXakFmTVIwd0d3WURWUVFEREJSb2IzTjBiV0Z6ZEdWeUxtMTVkbTVqCkxtTnZiVENDQVNJd0RRWUpLb1pJaHZjTkFRRUJCUUFEZ2dFUEFEQ0NBUW9DZ2dFQkFOWms1TzMzSFYwMHBCd3EKcW83RzREUWlJRlVvaWFxeHpiLzVZOHJCTlBGeU03Z2RQbWZXRXYyYlFmQWNJTkpNOVdadGJzN0FqeWZPQTY5MApsWG92MUwzbE9lMDJUK3U1REE5OHVycjRJTit5UkptQjU0TzBGQmMreTg2anVjMFk3MmZrM2RIdHBzVWEwYVRXCnFWblZmcmtHelVqZ2tNdmliNE5zSWFxdWxNcXhBSXc5MEQ3Q2MwNHZIMzNtVFRqNWsrQTBLdkhCSjRqK043dWEKYU1BRGlWaUx6VVhHdU1PUTdPTTFSbU5UVitJcVNwZWhQdFl4QmVHUC9hZHJXYWlOcDU0N3JSOC9vYXg0aEh0VwpsSGlSK2swdy9vQ2pYL1M4dEdPajNvOUhtcUI1WnFZS2ozNmg2bnRoOVlUb001Rmc5WFhpejJxMEI3ZXFNWExWCmordnZVbjBDQXdFQUFhTlRNRkV3SFFZRFZSME9CQllFRkw4b0dUQW43bTZ2M2VoYnVSdEVjWGtRK0NnNk1COEcKQTFVZEl3UVlNQmFBRkw4b0dUQW43bTZ2M2VoYnVSdEVjWGtRK0NnNk1BOEdBMVVkRXdFQi93UUZNQU1CQWY4dwpEUVlKS29aSWh2Y05BUUVMQlFBRGdnRUJBTWlnckorZUNYR3c3OFVobmVRYmNxSEhyWHVXNGI5TllhbzZjR3pRCnFkZU1JOC9VcE5jMENtVkNiQjZ1MmtZVXJSWGh4cU5XSW9mVnZqdGFEajFYblhJNmZrRkhMbGY1bWppVkpHaVoKaWtFUzRHNEExQ2NkbGM1di90RnhKTGJQOVpoT1hNVEVtdkdVUnFMeUZsNm05YXFNWEZLQmlYdGo5dmRvTlg3aAo2amRSOGR6TFlscFlyUnFTSCtPNm1lNkZ1eTg5bmdoN3FWUXNmRnd1c0p5a2V4UC9tSTl4ekJ3QjdZU1Q3dWpZCkVXaTZYcDhvQ0dTRFhtR3lRRGFBdXJHZXc0UzlPWXZzUzM1SDlPYW1vak1FWjAwbXJITjFLSDVwQlRCM2IzK1YKaDc4UWNic1VEMlEzMEcvWWlQV0s2cWE4RFpwWldrbThCSzFaV1RpQ1ZacnNIWHM9Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K"
+  tls.key: "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JSUV2QUlCQURBTkJna3Foa2lHOXcwQkFRRUZBQVNDQktZd2dnU2lBZ0VBQW9JQkFRRFdaT1R0OXgxZE5LUWMKS3FxT3h1QTBJaUJWS0ltcXNjMi8rV1BLd1RUeGNqTzRIVDVuMWhMOW0wSHdIQ0RTVFBWbWJXN093SThuemdPdgpkSlY2TDlTOTVUbnROay9ydVF3UGZMcTYrQ0Rmc2tTWmdlZUR0QlFYUHN2T283bk5HTzluNU4zUjdhYkZHdEdrCjFxbFoxWDY1QnMxSTRKREw0bStEYkNHcXJwVEtzUUNNUGRBK3duTk9MeDk5NWswNCtaUGdOQ3J4d1NlSS9qZTcKbW1qQUE0bFlpODFGeHJqRGtPempOVVpqVTFmaUtrcVhvVDdXTVFYaGovMm5hMW1vamFlZU82MGZQNkdzZUlSNwpWcFI0a2ZwTk1QNkFvMS8wdkxSam85NlBSNXFnZVdhbUNvOStvZXA3WWZXRTZET1JZUFYxNHM5cXRBZTNxakZ5CjFZL3I3MUo5QWdNQkFBRUNnZ0VBS3B3dVlMcEVzSVhhR1F3RXpuQXAxc3F5ak9KTDdDdys5WWpxSTcyL0dUNm0KbDFEZW1wSVNQNnU0RVBIeU53SGJJeEtjVzRTclh4Q2pyRjg2SnlqeStoUGhMYXRsK25aU2RwQ0daMHNSODR1eApkU1g3bnJJdmJRaEt4dVRFOUlXZ2JWQndJcjArTUQzNmpTMnB4bVEzZGF3cnFEQ1RycVh3SGxsakhwSm9tWmp6Cm5UZVltMEhQc21OMUpRV3M1MmdtTHZoNk5QZktYRThKQUZka0RWeXRzZFBXVEVQb29Sek1qMkxtZmtFSU9CZ0EKcll4NHplRUlVS1RHUVhWV2RZTjRCQlZQeFlNUnUxTElOVkdsNURHTDlnUHI2SmVFVllraEd6YnEzWDNsZlVVSwpKV21vZ0MrVlFVR1REcExzUnE3c2FURVVUcWJBMG1wOXQrYkNpVmc0V1FLQmdRRG1mZjBOcmIyMzBPS2VOUHUxCnpiT1lFTEJ3RlpWUjVHUHlINWpEU3QzZTBvRlBQMER2YWxJaDVhMStIU2cwVXJKVnA2MFA3S2Y3djI3c2ZKS2UKZHY3STRrRUtvWlh6cDlTbHlCS2FBS0tDWGo2bTBhNGVpNXlvZ0lFQlozQVpEZTQ1S1R6a3gyUEc1Y1dTMW13ZApqY0N6NnZYOXNvRkpPVC8reWp5VzJ1VHBaUUtCZ1FEdUh0WkF1VzNTN1pDc3V3NXVwNTJOQkpVZGpLZlRkWnlVCmdPYU0zc2RWd1ZUNzRQTWRYVjArWGNYR0dXcGhxNEEzVEduc21pVkpQOFZRVDhBVTV5T2Q2em5lcmlJT2VRK2sKaXF3NWhhWjYxZ2hOZG9oUWFSNzQ5VjZ0LzFDVXRSY1QxSGw0WW5hRjRMMytLRmg4U0VpbW1ocHBjeWJ0ZHIrYwpzeHpwanJHL09RS0JnRSs0SmF6MGVaaTVBNWhxaE9DbGk4YzlobmpOemo1cnV2SEVZZWF4M3preEg0NVVOMVpYCk5KOEt2RTNSTWRXZkFKVkZrRUxndkYwRElnOWpLcWJxUzBjWmtodG1OZUgzRzBKWGg2K0NKckxtZTg3ZzJOTXgKd0hZN00rTlRibDhNQldmNXpsam1hYWtpVVlwdTVTZjNuajNjTjBhTzFjNklvWXl6VCs5eE9CbE5Bb0dBU29ZdQpLZjJleUpmL1luLzhxVmNlTVFkUkgvbG9nUDdiTFlNV0pOcUlhbWRpa0o0N21HSWpENlRMaEE5cVF2MG8yS1c2CnRRa2RTRXFFRjNtT05UeU40aHUvZGRqcjRibXowcHh3QUdTNjBORHhza1M1cnVqbmY2VlRwNE16bGdjREhQcXYKdGFTalVZMGdDVTVaT3pSb1FIUVVkaEpMQ2FEVG9WaFJZU3QrcDhrQ2dZQWlFdG1OSGdxbmVrMTZzOExLby83YQpGczh1SlJVallJNnZtVTVGMWlMNnU0U0hyamowQ3lid3JQWGx5YXMvZFJYUnlTZG40bjBpTFU1MHZHMXlIcHZzCmwxdnVqNHVQNkI3SGpOZXFrS0o2dEg4UWZQdkdiT2htbEI2emxSOWtZYmNLdE8vMmFIZDV1SkE5cnFrOHJRV3oKMU1CRlNNbXF5VlYwSFVNRW50VDBWdz09Ci0tLS0tRU5EIFBSSVZBVEUgS0VZLS0tLS0K"
+#---
+#apiVersion: batch/v1
+#kind: Job
+#metadata:
+#  name: pterodactyl-migrate
+#  namespace: default
+#spec:
+#  template:
+#    spec:
+#      restartPolicy: Never   # Garantir que o job não reinicie automaticamente
+#      containers:
+#        - name: cron
+#          image: ghcr.io/pterodactyl/panel:v1.11.10
+#          command:
+#            - /usr/local/bin/php
+#            - /app/public/artisan
+#            - migrate
+#          envFrom:
+#            - configMapRef:
+#                name: panel-config
+#            - secretRef:
+#                name: panel-secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: default
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.0
+          ports:
+            - containerPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pterodactyl-mysql
+  namespace: default
+  labels:
+    app: mysql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mariadb:10.6
+          ports:
+            - containerPort: 3306
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: "X"
+            - name: MYSQL_DATABASE
+              value: "pterodactyl"
+            - name: MYSQL_USER
+              value: "pterodactyl"
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: panel-secret
+                  key: DB_PASSWORD
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+      volumes:
+        - name: mysql-data
+          persistentVolumeClaim:
+            claimName: mysql-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pterodactyl-wings
+  namespace: default
+  labels:
+    app: pterodactyl-wings
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pterodactyl-wings
+  template:
+    metadata:
+      labels:
+        app: pterodactyl-wings
+    spec:
+      containers:
+        - name: pterodactyl-wings
+          image: ghcr.io/pterodactyl/wings:v1.11.10
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: panel-config
+            - secretRef:
+                name: panel-secret
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: default
+spec:
+  ports:
+    - name: redis-port
+      port: 6379
+      targetPort: 6379
+  selector:
+    app: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pterodactyl-mysql
+  namespace: default
+spec:
+  ports:
+    - name: mysql-port
+      port: 3306
+      targetPort: 3306
+  selector:
+    app: mysql
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: k8s.io/ingress-nginx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-controller
+  namespace: ingress-nginx
+spec:
+  selector:
+    app: ingress-nginx
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 80
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 443
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pterodactyl-panel
+  namespace: default
+spec:
+  selector:
+    app: pterodactyl
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 443
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pterodactyl-wings
+  namespace: default
+spec:
+  ports:
+    - name: wings-port
+      port: 8080
+      targetPort: 8080
+  selector:
+    app: pterodactyl-wings
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pterodactyl-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: "nginx"
+  rules:
+    - host: hostmaster.myvnc.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pterodactyl-panel
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - hostmaster.myvnc.com
+      secretName: pterodactyl-tls
